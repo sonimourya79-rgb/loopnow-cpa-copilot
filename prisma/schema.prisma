@@ -1,0 +1,202 @@
+// Loopnow CPA Copilot — data model
+//
+// Every entity the assessment names explicitly: receipts, expenses,
+// gifi_codes, compliance_rules, agent_runs, tool_calls, audit_events,
+// approvals. Money fields are Decimal, never Float — a bookkeeping app that
+// stores currency as a float is a bug waiting for an audit to find it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A captured source document (photo, PDF, or manually entered) — the thing
+/// an expense is evidence for. One receipt can back at most one expense in
+/// this model; a multi-line receipt is a modeling decision documented in the
+/// README, not something this schema tries to solve generically.
+model Receipt {
+  id                String   @id @default(cuid())
+  supplierName      String?
+  gstHstNumber      String?
+  date              DateTime?
+  totalAmount       Decimal? @db.Decimal(12, 2)
+  itemizedDescription String?
+  purchaserName     String?
+  termsOfPayment    String?
+  /// Raw OCR/extraction text, kept verbatim and NEVER treated as executable
+  /// instruction — see the prompt-injection test in the agent tests. This
+  /// column exists so a human reviewer can always see exactly what the
+  /// source document said, independent of whatever the agent concluded.
+  rawText           String?
+  imageUrl          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  expense           Expense?
+
+  @@map("receipts")
+}
+
+/// One bookkeeping expense line — the thing the agent's pipeline actually
+/// produces and a human ultimately approves.
+model Expense {
+  id                      String    @id @default(cuid())
+  receiptId               String?   @unique
+  receipt                 Receipt?  @relation(fields: [receiptId], references: [id])
+
+  subtotal                Decimal   @db.Decimal(12, 2)
+  taxAmount               Decimal   @db.Decimal(12, 2)
+  totalAmount             Decimal   @db.Decimal(12, 2)
+
+  category                String
+  mealsExceptionType      String?
+
+  commercialUsePercentage Decimal   @db.Decimal(5, 2)
+  documentationStatus     String
+
+  documentationTier       Int
+  eligibilityPercentage   Decimal   @db.Decimal(5, 2)
+  eligibleItc             Decimal   @db.Decimal(12, 2)
+  itcReasonCode           String
+  itcRuleApplied          String
+
+  gifiCodeId              String?
+  gifiCode                GifiCode? @relation(fields: [gifiCodeId], references: [code])
+  gifiState               String    // CONFIRMED | REVIEW_REQUIRED
+
+  /// True whenever ANY step in the pipeline (ITC review, GIFI ambiguity,
+  /// documentation gap) needs a human decision before this posts anywhere.
+  requiresReview          Boolean   @default(false)
+  reviewedAt              DateTime?
+  reviewedBy              String?
+
+  createdAt               DateTime  @default(now())
+  updatedAt                DateTime @updatedAt
+
+  agentRuns               AgentRun[]
+  approvals               Approval[]
+
+  @@map("expenses")
+}
+
+/// The controlled GIFI catalogue — mirrors src/lib/rules/gifi.ts's in-code
+/// table so the backend can verify a proposed code exists without a code
+/// deploy for every catalogue change. Seeded from that same source at boot.
+model GifiCode {
+  code       String   @id
+  label      String
+  categories String[] // Postgres text[] — the categories this code defaults to
+
+  expenses   Expense[]
+
+  @@map("gifi_codes")
+}
+
+/// A versioned snapshot of a compliance constant (tier floors, meals
+/// percentages, etc.) — NOT the rule logic itself, which stays in code and
+/// gets code-reviewed and unit-tested like any other business logic. This
+/// table exists so a rate change (e.g. a future CRA update to the $150
+/// threshold) is an auditable data change with a timestamp and an author,
+/// not a silent code edit nobody can point to later.
+model ComplianceRule {
+  id          String   @id @default(cuid())
+  ruleKey     String   // e.g. "documentation_tier_2_floor", "meals_standard_percentage"
+  value       String   // stored as text; the consuming code parses to its real type
+  description String
+  effectiveAt DateTime @default(now())
+  supersededAt DateTime?
+
+  @@unique([ruleKey, effectiveAt])
+  @@map("compliance_rules")
+}
+
+/// One invocation of the agent against one expense — the audit unit for
+/// "what did the agent actually do, and how long did it take."
+model AgentRun {
+  id            String   @id @default(cuid())
+  expenseId     String
+  expense       Expense  @relation(fields: [expenseId], references: [id])
+
+  status        String   // running | completed | failed
+  model         String   // which LLM/model served this run
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
+
+  /// Time-to-first-token, in milliseconds — an explicit observability metric
+  /// the assessment names, not something inferred after the fact from logs.
+  ttftMs        Int?
+  totalDurationMs Int?
+  inputTokens   Int?
+  outputTokens  Int?
+
+  errorMessage  String?
+
+  toolCalls     ToolCall[]
+
+  @@map("agent_runs")
+}
+
+/// One tool invocation within an agent run — the granular trace a reviewer
+/// or a debugging session actually needs, distinct from the run-level
+/// summary above.
+model ToolCall {
+  id          String   @id @default(cuid())
+  agentRunId  String
+  agentRun    AgentRun @relation(fields: [agentRunId], references: [id])
+
+  toolName    String
+  /// The exact arguments the agent proposed, before this tool's own Zod
+  /// schema validated them — kept even when validation failed, since a
+  /// rejected proposal is itself useful audit evidence.
+  input       Json
+  /// Null when the call errored — see `errorMessage` instead.
+  output      Json?
+  succeeded   Boolean
+  errorMessage String?
+
+  latencyMs   Int?
+  startedAt   DateTime @default(now())
+
+  @@map("tool_calls")
+}
+
+/// The append-only ledger of anything that changed state. Nothing in this
+/// system mutates an Expense, a Receipt, or an Approval without a
+/// corresponding row here — this table is what makes "the agent modified
+/// state without authorization" (a named –20 penalty) detectable after the
+/// fact even if it somehow happened.
+model AuditEvent {
+  id          String   @id @default(cuid())
+  entityType  String   // "expense" | "receipt" | "approval" | ...
+  entityId    String
+  action      String   // "created" | "itc_calculated" | "gifi_classified" | "approved" | "rejected" | ...
+  actor       String   // "agent" | a human user id — never ambiguous which
+  detail      Json?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@map("audit_events")
+}
+
+/// The human-in-the-loop gate. Anything the rules engine returned with
+/// `requiresReview: true` — or any GIFI classification that came back
+/// REVIEW_REQUIRED — gets one of these instead of posting automatically.
+model Approval {
+  id          String    @id @default(cuid())
+  expenseId   String
+  expense     Expense   @relation(fields: [expenseId], references: [id])
+
+  reason      String    // why this needed review, copied from the rule engine's own reasoning
+  status      String    @default("pending") // pending | approved | rejected
+  decidedBy   String?
+  decidedAt   DateTime?
+  notes       String?
+
+  createdAt   DateTime  @default(now())
+
+  @@map("approvals")
+}

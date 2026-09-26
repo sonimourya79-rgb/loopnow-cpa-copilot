@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: loopnow_cpa
+    ports:
+      # Host port 5433, not 5432 — this machine has a native Postgres service
+      # already bound to 5432, and Windows silently routes host connections
+      # to it instead of the container regardless of what `docker ps` claims
+      # is published. Only affects host-side tooling (local `prisma` CLI
+      # commands); the `app` service below talks to `postgres:5432` over the
+      # internal Docker network, which has no such collision.
+      - "5433:5432"
+    volumes:
+      - loopnow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/loopnow_cpa"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-sonnet-5}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  loopnow_pg_data:
